@@ -39,15 +39,20 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     LaunchedEffect(parentMetaType, parentMetaId) {
-        playerMetaVideos = MetaDetailsRepository.peek(parentMetaType, parentMetaId)?.videos ?: emptyList()
+        playerMeta = MetaDetailsRepository.peek(parentMetaType, parentMetaId)
+        playerMetaVideos = playerMeta?.videos.orEmpty()
         if (playerMetaVideos.isEmpty()) {
-            playerMetaVideos = MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.videos ?: emptyList()
+            MetaDetailsRepository.fetch(parentMetaType, parentMetaId)?.let { meta ->
+                playerMeta = meta
+                playerMetaVideos = meta.videos
+            }
         }
     }
 
     LaunchedEffect(metaUiState.meta, parentMetaType, parentMetaId) {
         val currentMeta = metaUiState.meta ?: return@LaunchedEffect
         if (currentMeta.type == parentMetaType && currentMeta.id == parentMetaId) {
+            playerMeta = currentMeta
             playerMetaVideos = currentMeta.videos
         }
     }
@@ -83,7 +88,9 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         accumulatedSeekState = null
         speedBoostRestoreSpeed = null
         preferredAudioSelectionApplied = false
+        appliedAudioPreferences = null
         preferredSubtitleSelectionApplied = false
+        isUserExplicitAudioSelection = false
         isUserExplicitSubtitleSelection = false
         hasScannedTextTracksOnce = false
         selectedSubtitleIndex = -1
@@ -247,7 +254,13 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         fetchAddonSubtitlesForActiveItem()
     }
 
-    LaunchedEffect(playbackSnapshot.isLoading, playerController) {
+    LaunchedEffect(playerController, playerControllerSourceUrl, activeSourceUrl, preferredAudioLanguageTargets) {
+        if (playerControllerSourceUrl == activeSourceUrl) {
+            applyPreferredAudioTrack(preferredAudioLanguageTargets)
+        }
+    }
+
+    LaunchedEffect(playbackSnapshot.isLoading, playerController, preferredAudioLanguageTargets) {
         if (!playbackSnapshot.isLoading && playerController != null) {
             refreshTracks()
         }
@@ -329,6 +342,7 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
     }
 
     DisposableEffect(Unit) {
+        PlayerStreamsRepository.pauseSearchForPlayback()
         onDispose {
             playerController?.clearNowPlayingInfo()
             P2pStreamingEngine.shutdown()
@@ -367,9 +381,15 @@ private fun PlayerScreenRuntime.BindPlayerUiVisibilityEffects() {
         lockedOverlayVisible = false
     }
 
-    LaunchedEffect(playbackSnapshot.isPlaying, playbackSnapshot.isLoading, playbackSnapshot.durationMs, errorMessage) {
+    LaunchedEffect(
+        playerSettingsUiState.pauseOverlayEnabled,
+        playbackSnapshot.isPlaying,
+        playbackSnapshot.isLoading,
+        playbackSnapshot.durationMs,
+        errorMessage,
+    ) {
         pausedOverlayVisible = false
-        if (playbackSnapshot.isPlaying || playbackSnapshot.isLoading || playbackSnapshot.durationMs <= 0L || errorMessage != null) {
+        if (!playerSettingsUiState.pauseOverlayEnabled || playbackSnapshot.isPlaying || playbackSnapshot.isLoading || playbackSnapshot.durationMs <= 0L || errorMessage != null) {
             return@LaunchedEffect
         }
         delay(5000)
@@ -537,7 +557,11 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                 hasAired = PlayerNextEpisodeRules.hasEpisodeAired(nextVideo.released),
                 isWatched = isWatched,
                 unairedMessage = if (!PlayerNextEpisodeRules.hasEpisodeAired(nextVideo.released)) {
-                    "$airsPrefix ${nextVideo.released ?: tbaLabel}"
+                    PlayerNextEpisodeRules.formatUnairedEpisodeMessage(
+                        released = nextVideo.released,
+                        airsPrefix = airsPrefix,
+                        tbaLabel = tbaLabel,
+                    )
                 } else null,
             )
         } else null
@@ -664,67 +688,71 @@ internal fun PlayerScreenRuntime.tryRefreshCredentialedSourceAfterError(message:
     controlsVisible = !playerControlsLocked
 
     credentialRefreshJob = scope.launch {
-        PlayerStreamsRepository.loadSources(
-            type = type,
-            videoId = currentVideoId,
-            season = season,
-            episode = episode,
-            forceRefresh = true,
-        )
-
-        var refreshedStream: StreamItem? = null
-        var pollCount = 0
-        while (pollCount < CREDENTIAL_REFRESH_POLL_COUNT && refreshedStream == null) {
-            val state = PlayerStreamsRepository.sourceState.value
-            refreshedStream = findCredentialRefreshCandidate(
-                streams = state.groups.flatMap { it.streams },
-                failedUrl = failedUrl,
-                expectedProviderAddonId = expectedProviderAddonId,
-                expectedProviderName = expectedProviderName,
-                expectedStreamTitle = expectedStreamTitle,
-                expectedBingeGroup = expectedBingeGroup,
+        try {
+            PlayerStreamsRepository.loadSources(
+                type = type,
+                videoId = currentVideoId,
+                season = season,
+                episode = episode,
+                forceRefresh = true,
             )
-            if (
-                refreshedStream != null ||
-                state.emptyStateReason != null ||
-                (!state.isAnyLoading && state.groups.isNotEmpty())
-            ) {
-                break
+
+            var refreshedStream: StreamItem? = null
+            var pollCount = 0
+            while (pollCount < CREDENTIAL_REFRESH_POLL_COUNT && refreshedStream == null) {
+                val state = PlayerStreamsRepository.sourceState.value
+                refreshedStream = findCredentialRefreshCandidate(
+                    streams = state.groups.flatMap { it.streams },
+                    failedUrl = failedUrl,
+                    expectedProviderAddonId = expectedProviderAddonId,
+                    expectedProviderName = expectedProviderName,
+                    expectedStreamTitle = expectedStreamTitle,
+                    expectedBingeGroup = expectedBingeGroup,
+                )
+                if (
+                    refreshedStream != null ||
+                    state.emptyStateReason != null ||
+                    (!state.isAnyLoading && state.groups.isNotEmpty())
+                ) {
+                    break
+                }
+                delay(CREDENTIAL_REFRESH_POLL_INTERVAL_MS)
+                pollCount++
             }
-            delay(CREDENTIAL_REFRESH_POLL_INTERVAL_MS)
-            pollCount++
-        }
 
-        val stream = refreshedStream
-        if (stream == null) {
-            errorMessage = message
-            controlsVisible = !playerControlsLocked
-            return@launch
-        }
+            val stream = refreshedStream
+            if (stream == null) {
+                errorMessage = message
+                controlsVisible = !playerControlsLocked
+                return@launch
+            }
 
-        val refreshedUrl = stream.playableDirectUrl
-        if (refreshedUrl.isNullOrBlank() || refreshedUrl == failedUrl) {
-            errorMessage = message
-            controlsVisible = !playerControlsLocked
-            return@launch
-        }
+            val refreshedUrl = stream.playableDirectUrl
+            if (refreshedUrl.isNullOrBlank() || refreshedUrl == failedUrl) {
+                errorMessage = message
+                controlsVisible = !playerControlsLocked
+                return@launch
+            }
 
-        flushWatchProgress()
-        stopActiveP2pStream()
-        activeSourceUrl = refreshedUrl
-        activeSourceAudioUrl = null
-        activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
-        activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
-        activeStreamType = stream.streamType
-        activeStreamTitle = stream.streamLabel
-        activeStreamSubtitle = stream.streamSubtitle
-        activeProviderName = stream.addonName
-        activeProviderAddonId = stream.addonId
-        currentStreamBingeGroup = stream.behaviorHints.bingeGroup
-        activeInitialPositionMs = savedPositionMs
-        activeInitialProgressFraction = null
-        showSourcesPanel = false
-        controlsVisible = true
+            flushWatchProgress()
+            stopActiveP2pStream()
+            activeSourceUrl = refreshedUrl
+            activeSourceAudioUrl = null
+            activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
+            activeSourceResponseHeaders = sanitizePlaybackResponseHeaders(stream.behaviorHints.proxyHeaders?.response)
+            activeStreamType = stream.streamType
+            activeStreamTitle = stream.streamLabel
+            activeStreamSubtitle = stream.streamSubtitle
+            activeProviderName = stream.addonName
+            activeProviderAddonId = stream.addonId
+            currentStreamBingeGroup = stream.behaviorHints.bingeGroup
+            activeInitialPositionMs = savedPositionMs
+            activeInitialProgressFraction = null
+            showSourcesPanel = false
+            controlsVisible = true
+        } finally {
+            PlayerStreamsRepository.stopSourcesLoading()
+        }
     }
     return true
 }

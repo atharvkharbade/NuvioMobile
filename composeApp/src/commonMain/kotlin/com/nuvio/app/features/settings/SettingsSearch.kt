@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.isIos
+import com.nuvio.app.supportsPosterNavigationMotion
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 
@@ -548,6 +549,11 @@ internal fun settingsSearchEntries(
                 stringResource(Res.string.settings_playback_show_loading_overlay_description),
             ),
             PlaybackSearchRow(
+                "pause-overlay",
+                stringResource(Res.string.settings_playback_pause_overlay),
+                stringResource(Res.string.settings_playback_pause_overlay_description),
+            ),
+            PlaybackSearchRow(
                 "external-player",
                 stringResource(Res.string.settings_playback_external_player),
                 stringResource(Res.string.settings_playback_external_player_description_android),
@@ -749,6 +755,17 @@ internal fun settingsSearchEntries(
     }
 
     val detailAppearanceSection = stringResource(Res.string.settings_meta_section_appearance)
+    if (supportsPosterNavigationMotion) {
+        addRow(
+            page = SettingsPage.MetaScreen,
+            key = "meta-poster-transition",
+            title = stringResource(Res.string.settings_meta_poster_transition),
+            description = stringResource(Res.string.settings_meta_poster_transition_description),
+            pageLabel = detailPage,
+            section = detailAppearanceSection,
+            icon = Icons.Rounded.Tune,
+        )
+    }
     listOf(
         PlaybackSearchRow("meta-background-mode", stringResource(Res.string.settings_meta_background_mode), stringResource(Res.string.settings_meta_background_mode_description)),
         PlaybackSearchRow("meta-tabs", stringResource(Res.string.settings_meta_tab_layout), stringResource(Res.string.settings_meta_tab_layout_description)),
@@ -983,7 +1000,7 @@ private fun addContinueWatchingRows(
 
 internal fun LazyListScope.settingsSearchRootContent(
     query: String,
-    entries: List<SettingsSearchEntry>,
+    entries: @Composable () -> List<SettingsSearchEntry>,
     isTablet: Boolean,
     showSearchField: Boolean,
     animateSearchField: Boolean,
@@ -1003,12 +1020,11 @@ internal fun LazyListScope.settingsSearchRootContent(
 
     if (query.isBlank()) return
 
-    val results = settingsSearchResults(
-        query = query,
-        entries = entries,
-    )
-
     item(key = "settings-search-results") {
+        val results = settingsSearchResults(
+            query = query,
+            entries = entries(),
+        )
         if (results.isEmpty()) {
             SettingsSearchEmptyState(isTablet = isTablet)
         } else {
